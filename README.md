@@ -166,3 +166,7 @@ and results for targets that configure status lookup.
 ```bash
 uv run pytest
 ```
+
+## License
+
+[MIT License](LICENSE)
