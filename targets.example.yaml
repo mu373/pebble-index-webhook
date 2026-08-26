@@ -1,0 +1,55 @@
+version: 1
+
+targets:
+  # The personal agent gateway is one implementation of the target contract.
+  - name: personal-agent-gateway
+    enabled: true
+    url: http://127.0.0.1:8790/v1/events
+    timeout_seconds: 30
+    auth:
+      header: Authorization
+      scheme: Bearer
+      token_env: GATEWAY_TOKEN
+    request:
+      event_field: event
+      audio_field: audio
+      audio_filename: index-recording.m4a
+      audio_mime_type: audio/mp4
+      include_audio: true
+      template: |
+        {
+          "event_id": {{ event.event_id | tojson }},
+          "source": {{ event.source | tojson }},
+          "sender_id": {{ event.sender_id | tojson }},
+          "conversation_id": {{ event.conversation_id | tojson }},
+          "content": {{ event.content | tojson }},
+          "reply": {{ event.reply | tojson }},
+          "metadata": {{ event.metadata | tojson }}
+        }
+    status:
+      url_template: http://127.0.0.1:8790/v1/events/{id}
+      id_field: id
+
+  # Enable this entry to fan the same Pebble event out to another HTTP service.
+  - name: example-webhook
+    enabled: false
+    url: https://receiver.example.com/hooks/pebble
+    headers:
+      X-Event-Source: pebble-index
+    auth:
+      header: X-API-Key
+      scheme: ""
+      token_env: EXAMPLE_WEBHOOK_TOKEN
+    request:
+      event_field: payload
+      audio_field: recording
+      audio_filename: pebble-recording.m4a
+      audio_mime_type: audio/mp4
+      include_audio: true
+      template: |
+        {
+          "id": {{ event.event_id | tojson }},
+          "sender": {{ event.sender_id | tojson }},
+          "content": {{ event.content | tojson }},
+          "recorded_at": {{ event.metadata.recorded_at | tojson }}
+        }
