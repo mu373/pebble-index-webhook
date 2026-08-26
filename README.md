@@ -10,16 +10,15 @@ This service does only four things:
 3. Convert Pebble fields into a normalized event envelope.
 4. Forward the event and optional audio to a configured target.
 
-It does not transcribe audio, select an agent, load tools, or deliver task results.
-Those concerns belong to the target service.
-
 ## Flow
 
-```text
-Index 01 -> Pebble app -> /webhooks/index01 -> configured HTTP target
+```mermaid
+flowchart LR
+    A["Webhook<br/>Receive Pebble event"] --> B["Process<br/>Authenticate, persist, normalize"]
+    B --> C["Forward<br/>Render and send to enabled targets"]
 ```
 
-The public endpoint remains:
+The endpoint is:
 
 ```text
 POST /webhooks/index01
@@ -32,9 +31,9 @@ its URL, authentication, headers, multipart field names, JSON template, and opti
 status lookup. An audio event defaults to the Japanese language hint `ja`;
 `PEBBLE_LANGUAGE_HINT` can override or disable it.
 
-## Target contract
+## Template input
 
-The adapter sends `multipart/form-data` with an `event` field containing JSON:
+Before rendering a target-specific payload, the adapter constructs this canonical event:
 
 ```json
 {
@@ -53,10 +52,15 @@ The adapter sends `multipart/form-data` with an `event` field containing JSON:
 }
 ```
 
-This is the template context available as `event`. A target's Jinja template transforms
-it into the JSON placed in that target's configured multipart event field. For
-recordings, the request also includes a file using the target's configured audio field.
-The target must return a JSON object after accepting the event.
+This adapter-specific structure is available to Jinja as `event`. Each target template
+can transform it into the structure expected by that receiver.
+
+## Target interface
+
+The rendered JSON is sent using `multipart/form-data`. Each target configures the JSON
+field name and, for recordings, the audio field name, filename, and media type. The
+target must return a JSON object after accepting the request. No particular event schema
+is imposed on the target because its template defines that schema.
 
 ## Configure
 
