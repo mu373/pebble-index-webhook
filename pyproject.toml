@@ -15,11 +15,19 @@ dependencies = [
 [dependency-groups]
 dev = [
   "pytest>=8.4,<10",
+  "pytest-cov>=7,<8",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+
+[tool.coverage.report]
+show_missing = true
 
 [tool.setuptools.packages.find]
 include = ["app*"]
