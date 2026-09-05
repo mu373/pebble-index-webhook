@@ -584,6 +584,11 @@ async def health() -> dict[str, Any]:
     }
 
 
+@app.get("/healthz")
+async def get_liveness() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.get("/events/{event_id}")
 async def event_status(
     event_id: str,

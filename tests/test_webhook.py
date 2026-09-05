@@ -56,6 +56,15 @@ def wait_until_forwarded(client, event_id):
     raise AssertionError("event was not forwarded")
 
 
+def test_gets_public_liveness_without_internal_configuration(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+    with TestClient(main.app) as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 def test_accepts_and_forwards_pebble_audio(monkeypatch, tmp_path):
     main, captured = load_app(monkeypatch, tmp_path)
     with TestClient(main.app) as client:
