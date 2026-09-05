@@ -9,7 +9,7 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Mapping
 from urllib.parse import quote
 
 import httpx
@@ -78,88 +78,83 @@ def _require_boolean(value: Any, location: str) -> bool:
     return value
 
 
+def _parse_target(
+    value: Any, index: int, environment: Mapping[str, str]
+) -> Target | None:
+    item = _require_mapping(value, f"targets[{index}]")
+    if not _require_boolean(item.get("enabled", True), f"targets[{index}].enabled"):
+        return None
+    name = str(item.get("name", "")).strip()
+    url = str(item.get("url", "")).strip()
+    if not name or not url:
+        raise ValueError(f"targets[{index}] requires name and url")
+    auth = _require_mapping(item.get("auth"), f"targets[{index}].auth")
+    token = str(auth.get("token", ""))
+    token_env = str(auth.get("token_env", "")).strip()
+    if token and token_env:
+        raise ValueError(f"target {name} cannot set both token and token_env")
+    if token_env:
+        token = environment.get(token_env, "")
+        if not token:
+            raise ValueError(f"target {name} requires environment variable {token_env}")
+    header_values = _require_mapping(item.get("headers"), f"targets[{index}].headers")
+    request = _require_mapping(item.get("request"), f"targets[{index}].request")
+    status_config = _require_mapping(item.get("status"), f"targets[{index}].status")
+    return Target(
+        name=name,
+        url=url,
+        timeout_seconds=float(item.get("timeout_seconds", 30)),
+        headers={str(key): str(header) for key, header in header_values.items()},
+        auth_header=str(auth.get("header", "Authorization")),
+        auth_scheme=str(auth.get("scheme", "Bearer")),
+        auth_token=token,
+        request=TargetRequest(
+            event_field=str(request.get("event_field", "event")),
+            audio_field=str(request.get("audio_field", "audio")),
+            audio_filename=str(request.get("audio_filename", "index-recording.m4a")),
+            audio_mime_type=str(request.get("audio_mime_type", "audio/mp4")),
+            include_audio=_require_boolean(
+                request.get("include_audio", True),
+                f"targets[{index}].request.include_audio",
+            ),
+            event_template=str(request.get("template", "{{ event | tojson }}")),
+        ),
+        status=TargetStatus(
+            url_template=str(status_config.get("url_template", "")),
+            id_field=str(status_config.get("id_field", "id")),
+        ),
+    )
+
+
+def parse_targets_config(
+    document: Any, location: str, environment: Mapping[str, str]
+) -> tuple[Target, ...]:
+    """Validate target configuration using only caller-provided values."""
+    root = _require_mapping(document, location)
+    if root.get("version", 1) != 1:
+        raise ValueError(f"unsupported target configuration version in {location}")
+    target_values = root.get("targets")
+    if not isinstance(target_values, list):
+        raise ValueError(f"{location}: targets must be a list")
+    targets = [
+        target
+        for index, value in enumerate(target_values)
+        if (target := _parse_target(value, index, environment)) is not None
+    ]
+    names: set[str] = set()
+    for target in targets:
+        if target.name in names:
+            raise ValueError(f"duplicate target name: {target.name}")
+        names.add(target.name)
+    if not targets:
+        raise ValueError(f"{location}: at least one target must be enabled")
+    return tuple(targets)
+
+
 def _load_yaml_targets(path: Path) -> tuple[Target, ...]:
     if not path.is_file():
         raise ValueError(f"target configuration does not exist: {path}")
-    document = yaml.safe_load(path.read_text())
-    root = _require_mapping(document, str(path))
-    if root.get("version", 1) != 1:
-        raise ValueError(f"unsupported target configuration version in {path}")
-    target_values = root.get("targets")
-    if not isinstance(target_values, list):
-        raise ValueError(f"{path}: targets must be a list")
-
-    targets: list[Target] = []
-    names: set[str] = set()
-    for index, value in enumerate(target_values):
-        item = _require_mapping(value, f"targets[{index}]")
-        if not _require_boolean(
-            item.get("enabled", True), f"targets[{index}].enabled"
-        ):
-            continue
-        name = str(item.get("name", "")).strip()
-        url = str(item.get("url", "")).strip()
-        if not name or not url:
-            raise ValueError(f"targets[{index}] requires name and url")
-        if name in names:
-            raise ValueError(f"duplicate target name: {name}")
-        names.add(name)
-
-        auth = _require_mapping(item.get("auth"), f"targets[{index}].auth")
-        token = str(auth.get("token", ""))
-        token_env = str(auth.get("token_env", "")).strip()
-        if token and token_env:
-            raise ValueError(f"target {name} cannot set both token and token_env")
-        if token_env:
-            token = os.getenv(token_env, "")
-            if not token:
-                raise ValueError(
-                    f"target {name} requires environment variable {token_env}"
-                )
-
-        header_values = _require_mapping(
-            item.get("headers"), f"targets[{index}].headers"
-        )
-        headers = {str(key): str(header) for key, header in header_values.items()}
-        request = _require_mapping(
-            item.get("request"), f"targets[{index}].request"
-        )
-        status_config = _require_mapping(
-            item.get("status"), f"targets[{index}].status"
-        )
-        targets.append(
-            Target(
-                name=name,
-                url=url,
-                timeout_seconds=float(item.get("timeout_seconds", 30)),
-                headers=headers,
-                auth_header=str(auth.get("header", "Authorization")),
-                auth_scheme=str(auth.get("scheme", "Bearer")),
-                auth_token=token,
-                request=TargetRequest(
-                    event_field=str(request.get("event_field", "event")),
-                    audio_field=str(request.get("audio_field", "audio")),
-                    audio_filename=str(
-                        request.get("audio_filename", "index-recording.m4a")
-                    ),
-                    audio_mime_type=str(request.get("audio_mime_type", "audio/mp4")),
-                    include_audio=_require_boolean(
-                        request.get("include_audio", True),
-                        f"targets[{index}].request.include_audio",
-                    ),
-                    event_template=str(
-                        request.get("template", "{{ event | tojson }}")
-                    ),
-                ),
-                status=TargetStatus(
-                    url_template=str(status_config.get("url_template", "")),
-                    id_field=str(status_config.get("id_field", "id")),
-                ),
-            )
-        )
-    if not targets:
-        raise ValueError(f"{path}: at least one target must be enabled")
-    return tuple(targets)
+    return parse_targets_config(yaml.safe_load(path.read_text()), str(path), os.environ)
 
 
 def _environment_target() -> tuple[Target, ...]:
@@ -242,7 +237,7 @@ def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def _authorize(authorization: str | None) -> None:
+def _require_webhook_authorization(authorization: str | None) -> None:
     if not settings.webhook_token:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -268,7 +263,7 @@ async def _save_audio(upload: UploadFile, destination: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _normalized_event(
+def _normalize_event(
     local_event_id: str, metadata: dict[str, Any], has_audio: bool
 ) -> dict[str, Any]:
     if has_audio:
@@ -347,7 +342,7 @@ async def _send_event(
         return result
 
 
-async def _target_event_status(target: Target, target_id: str) -> dict[str, Any]:
+async def _fetch_target_event_status(target: Target, target_id: str) -> dict[str, Any]:
     if not target.status.url_template:
         raise RuntimeError(f"target {target.name} does not configure status lookup")
     encoded_id = quote(target_id, safe="")
@@ -364,7 +359,26 @@ async def _target_event_status(target: Target, target_id: str) -> dict[str, Any]
         return result
 
 
-async def _forward(local_event_id: str) -> None:
+def summarize_target_deliveries(
+    targets: tuple[Target, ...], results: list[Any]
+) -> tuple[dict[str, Any], str, str | None]:
+    """Aggregate target outcomes without performing I/O."""
+    deliveries: dict[str, Any] = {}
+    failed = 0
+    for target, result in zip(targets, results, strict=True):
+        if isinstance(result, BaseException):
+            failed += 1
+            deliveries[target.name] = {"status": "failed", "error": str(result)}
+        else:
+            deliveries[target.name] = {"status": "forwarded", "response": result}
+    if failed == 0:
+        return deliveries, "forwarded", None
+    if failed == len(targets):
+        return deliveries, "failed", "all target deliveries failed"
+    return deliveries, "partial", f"{failed} target deliveries failed"
+
+
+async def _forward_event_to_targets(local_event_id: str) -> None:
     event_dir = settings.data_dir / "events" / local_event_id
     metadata_path = event_dir / "metadata.json"
     metadata = _read_json(metadata_path)
@@ -374,7 +388,7 @@ async def _forward(local_event_id: str) -> None:
         if not settings.targets:
             raise RuntimeError("no targets are configured")
         audio_path = event_dir / "audio.m4a"
-        event = _normalized_event(local_event_id, metadata, audio_path.exists())
+        event = _normalize_event(local_event_id, metadata, audio_path.exists())
         results = await asyncio.gather(
             *(
                 _send_event(
@@ -386,23 +400,12 @@ async def _forward(local_event_id: str) -> None:
             ),
             return_exceptions=True,
         )
-        deliveries: dict[str, Any] = {}
-        failed = 0
         for target, result in zip(settings.targets, results):
             if isinstance(result, BaseException):
-                failed += 1
-                deliveries[target.name] = {
-                    "status": "failed",
-                    "error": str(result),
-                }
                 logger.error(
                     "failed to forward event %s to %s", local_event_id, target.name
                 )
                 continue
-            deliveries[target.name] = {
-                "status": "forwarded",
-                "response": result,
-            }
             logger.info(
                 "forwarded event %s target=%s target_id=%s",
                 local_event_id,
@@ -410,18 +413,17 @@ async def _forward(local_event_id: str) -> None:
                 result.get(target.status.id_field),
             )
 
+        deliveries, delivery_status, delivery_error = summarize_target_deliveries(
+            settings.targets, results
+        )
         metadata["deliveries"] = deliveries
         metadata.pop("target", None)
         metadata.pop("gateway", None)
-        if failed == 0:
-            metadata["status"] = "forwarded"
+        metadata["status"] = delivery_status
+        if delivery_error is None:
             metadata.pop("error", None)
-        elif failed == len(settings.targets):
-            metadata["status"] = "failed"
-            metadata["error"] = "all target deliveries failed"
         else:
-            metadata["status"] = "partial"
-            metadata["error"] = f"{failed} target deliveries failed"
+            metadata["error"] = delivery_error
         _write_json(metadata_path, metadata)
     except Exception as exc:
         logger.exception("failed to forward event %s", local_event_id)
@@ -430,11 +432,11 @@ async def _forward(local_event_id: str) -> None:
         _write_json(metadata_path, metadata)
 
 
-async def _worker() -> None:
+async def _run_forwarding_worker() -> None:
     while True:
         event_id = await queue.get()
         try:
-            await _forward(event_id)
+            await _forward_event_to_targets(event_id)
         finally:
             queue.task_done()
 
@@ -443,7 +445,10 @@ async def _worker() -> None:
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     events_dir = settings.data_dir / "events"
     events_dir.mkdir(parents=True, exist_ok=True)
-    tasks = [asyncio.create_task(_worker()) for _ in range(max(settings.workers, 1))]
+    tasks = [
+        asyncio.create_task(_run_forwarding_worker())
+        for _ in range(max(settings.workers, 1))
+    ]
     for metadata_path in events_dir.glob("*/metadata.json"):
         metadata = _read_json(metadata_path)
         if metadata.get("status") in {"received", "forwarding"}:
@@ -480,7 +485,7 @@ async def event_status(
     event_id: str,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _authorize(authorization)
+    _require_webhook_authorization(authorization)
     if len(event_id) != 24 or any(
         character not in "0123456789abcdef" for character in event_id
     ):
@@ -501,7 +506,9 @@ async def event_status(
         if not target_id:
             continue
         try:
-            target_events[name] = await _target_event_status(target, str(target_id))
+            target_events[name] = await _fetch_target_event_status(
+                target, str(target_id)
+            )
         except Exception as exc:
             target_events[name] = {"error": str(exc)}
     if target_events:
@@ -514,12 +521,52 @@ async def event_status(
         target_id = old_target_response.get(target.status.id_field)
         if target_id and target.status.url_template:
             try:
-                response["target_event"] = await _target_event_status(
+                response["target_event"] = await _fetch_target_event_status(
                     target, str(target_id)
                 )
             except Exception as exc:
                 response["target_error"] = str(exc)
     return response
+
+
+def compute_event_id(
+    recorded_at: str,
+    client: str,
+    transcription: str | None,
+    audio_sha256: str = "",
+) -> str:
+    seed = f"{recorded_at}\0{client}\0{transcription or ''}".encode()
+    return hashlib.sha256(seed + audio_sha256.encode()).hexdigest()[:24]
+
+
+def build_event_metadata(
+    event_id: str,
+    *,
+    recorded_at: str,
+    client: str,
+    trigger: str | None,
+    transcription: str | None,
+    audio_size: int,
+    audio_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "status": "received",
+        "recorded_at": recorded_at,
+        "client": client,
+        "trigger": trigger,
+        "audio_size": audio_size,
+        "audio_sha256": audio_sha256 or None,
+        "pebble_transcription": transcription.strip() if transcription else None,
+    }
+
+
+def _discard_provisional_event(path: Path) -> None:
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        child.unlink()
+    path.rmdir()
 
 
 @app.post("/webhooks/index01", status_code=status.HTTP_202_ACCEPTED)
@@ -531,12 +578,11 @@ async def index01_webhook(
     authorization: str | None = Header(default=None),
     x_index_trigger: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    _authorize(authorization)
+    _require_webhook_authorization(authorization)
     if audio is None and not transcription:
         raise HTTPException(status_code=422, detail="audio or transcription is required")
 
-    seed = f"{recorded_at}\0{client}\0{transcription or ''}".encode()
-    provisional_id = hashlib.sha256(seed).hexdigest()[:24]
+    provisional_id = compute_event_id(recorded_at, client, transcription)
     provisional_dir = settings.data_dir / "events" / f".{provisional_id}"
     provisional_dir.mkdir(parents=True, exist_ok=True)
 
@@ -548,31 +594,27 @@ async def index01_webhook(
                 audio, provisional_dir / "audio.m4a"
             )
 
-        event_id = hashlib.sha256(seed + audio_sha256.encode()).hexdigest()[:24]
+        event_id = compute_event_id(
+            recorded_at, client, transcription, audio_sha256
+        )
         event_dir = settings.data_dir / "events" / event_id
         if event_dir.exists():
-            for child in provisional_dir.iterdir():
-                child.unlink()
-            provisional_dir.rmdir()
+            _discard_provisional_event(provisional_dir)
             return {"status": "duplicate", "event_id": event_id}
 
         provisional_dir.rename(event_dir)
-        metadata = {
-            "event_id": event_id,
-            "status": "received",
-            "recorded_at": recorded_at,
-            "client": client,
-            "trigger": x_index_trigger,
-            "audio_size": audio_size,
-            "audio_sha256": audio_sha256 or None,
-            "pebble_transcription": transcription.strip() if transcription else None,
-        }
+        metadata = build_event_metadata(
+            event_id,
+            recorded_at=recorded_at,
+            client=client,
+            trigger=x_index_trigger,
+            transcription=transcription,
+            audio_size=audio_size,
+            audio_sha256=audio_sha256,
+        )
         _write_json(event_dir / "metadata.json", metadata)
         await queue.put(event_id)
         return {"status": "accepted", "event_id": event_id}
     except Exception:
-        if provisional_dir.exists():
-            for child in provisional_dir.iterdir():
-                child.unlink()
-            provisional_dir.rmdir()
+        _discard_provisional_event(provisional_dir)
         raise

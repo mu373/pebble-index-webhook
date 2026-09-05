@@ -37,7 +37,7 @@ def load_app(monkeypatch, tmp_path):
         }
 
     monkeypatch.setattr(main, "_send_event", fake_send_event)
-    monkeypatch.setattr(main, "_target_event_status", fake_target_status)
+    monkeypatch.setattr(main, "_fetch_target_event_status", fake_target_status)
     return main, captured
 
 
@@ -245,3 +245,60 @@ targets:
     assert main._target_headers(main.settings.targets[0]) == {
         "Authorization": "Bearer normalized-secret"
     }
+
+
+def test_pure_event_builders_are_deterministic(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+
+    event_id = main.compute_event_id("1787752800000", "ring", "hello", "abc")
+    metadata = main.build_event_metadata(
+        event_id,
+        recorded_at="1787752800000",
+        client="ring",
+        trigger=None,
+        transcription=" hello ",
+        audio_size=3,
+        audio_sha256="abc",
+    )
+
+    assert event_id == main.compute_event_id(
+        "1787752800000", "ring", "hello", "abc"
+    )
+    assert metadata["event_id"] == event_id
+    assert metadata["pebble_transcription"] == "hello"
+
+
+def test_summarizes_partial_target_failures(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+    targets = (
+        main.Target("first", "http://first.test"),
+        main.Target("second", "http://second.test"),
+    )
+
+    deliveries, status, error = main.summarize_target_deliveries(
+        targets, [{"id": "ok"}, RuntimeError("offline")]
+    )
+
+    assert status == "partial"
+    assert error == "1 target deliveries failed"
+    assert deliveries["first"]["status"] == "forwarded"
+    assert deliveries["second"] == {"status": "failed", "error": "offline"}
+
+
+def test_parses_targets_without_reading_process_environment(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+    targets = main.parse_targets_config(
+        {
+            "targets": [
+                {
+                    "name": "gateway",
+                    "url": "http://gateway.test/events",
+                    "auth": {"token_env": "GATEWAY_TOKEN"},
+                }
+            ]
+        },
+        "memory",
+        {"GATEWAY_TOKEN": "provided"},
+    )
+
+    assert targets[0].auth_token == "provided"
