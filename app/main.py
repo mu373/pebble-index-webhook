@@ -9,7 +9,7 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Literal, Mapping
 from urllib.parse import quote
 
 import httpx
@@ -25,6 +25,7 @@ template_environment = SandboxedEnvironment(undefined=StrictUndefined, autoescap
 
 @dataclass(frozen=True)
 class TargetRequest:
+    body_format: Literal["multipart", "json"] = "multipart"
     event_field: str = "event"
     audio_field: str = "audio"
     audio_filename: str = "index-recording.m4a"
@@ -50,6 +51,7 @@ class Target:
     auth_token: str = ""
     request: TargetRequest = TargetRequest()
     status: TargetStatus = TargetStatus()
+    is_url_secret: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,9 @@ class TargetEventRequest:
     url: str
     timeout_seconds: float
     headers: dict[str, str]
-    data: dict[str, str]
+    body_format: Literal["multipart", "json"]
+    form_data: dict[str, str] | None
+    json_body: Any | None
     audio_field: str | None
     audio_filename: str | None
     audio_mime_type: str | None
@@ -103,6 +107,12 @@ def _require_boolean(value: Any, location: str) -> bool:
     return value
 
 
+def _require_body_format(value: Any, location: str) -> Literal["multipart", "json"]:
+    if value not in {"multipart", "json"}:
+        raise ValueError(f"{location} must be multipart or json")
+    return value
+
+
 def _parse_target(
     value: Any, index: int, environment: Mapping[str, str]
 ) -> Target | None:
@@ -111,8 +121,15 @@ def _parse_target(
         return None
     name = str(item.get("name", "")).strip()
     url = str(item.get("url", "")).strip()
-    if not name or not url:
-        raise ValueError(f"targets[{index}] requires name and url")
+    url_env = str(item.get("url_env", "")).strip()
+    if not name or (not url and not url_env):
+        raise ValueError(f"targets[{index}] requires name and url or url_env")
+    if url and url_env:
+        raise ValueError(f"target {name} cannot set both url and url_env")
+    if url_env:
+        url = environment.get(url_env, "").strip()
+        if not url:
+            raise ValueError(f"target {name} requires environment variable {url_env}")
     auth = _require_mapping(item.get("auth"), f"targets[{index}].auth")
     token = str(auth.get("token", ""))
     token_env = str(auth.get("token_env", "")).strip()
@@ -125,6 +142,16 @@ def _parse_target(
     header_values = _require_mapping(item.get("headers"), f"targets[{index}].headers")
     request = _require_mapping(item.get("request"), f"targets[{index}].request")
     status_config = _require_mapping(item.get("status"), f"targets[{index}].status")
+    body_format = _require_body_format(
+        request.get("body_format", "multipart"),
+        f"targets[{index}].request.body_format",
+    )
+    include_audio = _require_boolean(
+        request.get("include_audio", body_format == "multipart"),
+        f"targets[{index}].request.include_audio",
+    )
+    if body_format == "json" and include_audio:
+        raise ValueError(f"target {name} cannot include audio with a JSON request")
     return Target(
         name=name,
         url=url,
@@ -134,20 +161,19 @@ def _parse_target(
         auth_scheme=str(auth.get("scheme", "Bearer")),
         auth_token=token,
         request=TargetRequest(
+            body_format=body_format,
             event_field=str(request.get("event_field", "event")),
             audio_field=str(request.get("audio_field", "audio")),
             audio_filename=str(request.get("audio_filename", "index-recording.m4a")),
             audio_mime_type=str(request.get("audio_mime_type", "audio/mp4")),
-            include_audio=_require_boolean(
-                request.get("include_audio", True),
-                f"targets[{index}].request.include_audio",
-            ),
+            include_audio=include_audio,
             event_template=str(request.get("template", "{{ event | tojson }}")),
         ),
         status=TargetStatus(
             url_template=str(status_config.get("url_template", "")),
             id_field=str(status_config.get("id_field", "id")),
         ),
+        is_url_secret=bool(url_env),
     )
 
 
@@ -186,6 +212,14 @@ def _environment_target() -> tuple[Target, ...]:
     url = os.getenv("TARGET_URL", _legacy_target_url())
     if not url:
         return ()
+    body_format = _require_body_format(
+        os.getenv("TARGET_BODY_FORMAT", "multipart"), "TARGET_BODY_FORMAT"
+    )
+    include_audio = os.getenv(
+        "TARGET_INCLUDE_AUDIO", "true" if body_format == "multipart" else "false"
+    ).lower() not in {"0", "false", "no"}
+    if body_format == "json" and include_audio:
+        raise ValueError("environment target cannot include audio with a JSON request")
     return (
         Target(
             name=os.getenv("TARGET_NAME", "default"),
@@ -200,14 +234,14 @@ def _environment_target() -> tuple[Target, ...]:
             auth_scheme=os.getenv("TARGET_AUTH_SCHEME", "Bearer"),
             auth_token=os.getenv("TARGET_TOKEN", os.getenv("GATEWAY_TOKEN", "")),
             request=TargetRequest(
+                body_format=body_format,
                 event_field=os.getenv("TARGET_EVENT_FIELD", "event"),
                 audio_field=os.getenv("TARGET_AUDIO_FIELD", "audio"),
                 audio_filename=os.getenv(
                     "TARGET_AUDIO_FILENAME", "index-recording.m4a"
                 ),
                 audio_mime_type=os.getenv("TARGET_AUDIO_MIME_TYPE", "audio/mp4"),
-                include_audio=os.getenv("TARGET_INCLUDE_AUDIO", "true").lower()
-                not in {"0", "false", "no"},
+                include_audio=include_audio,
                 event_template=os.getenv(
                     "TARGET_EVENT_TEMPLATE", "{{ event | tojson }}"
                 ),
@@ -218,6 +252,7 @@ def _environment_target() -> tuple[Target, ...]:
                 ),
                 id_field=os.getenv("TARGET_ID_FIELD", "id"),
             ),
+            is_url_secret=True,
         ),
     )
 
@@ -353,16 +388,42 @@ def build_target_event_request(
     target: Target, event: Mapping[str, Any], has_audio: bool
 ) -> TargetEventRequest:
     """Describe an outbound target request without performing I/O."""
+    if target.request.body_format == "json" and target.request.include_audio:
+        raise ValueError(
+            f"target {target.name} cannot include audio with a JSON request"
+        )
     include_audio = has_audio and target.request.include_audio
+    rendered_event = render_target_event(target, event)
     return TargetEventRequest(
         url=target.url,
         timeout_seconds=target.timeout_seconds,
         headers=build_target_headers(target),
-        data={target.request.event_field: render_target_event(target, event)},
+        body_format=target.request.body_format,
+        form_data=(
+            {target.request.event_field: rendered_event}
+            if target.request.body_format == "multipart"
+            else None
+        ),
+        json_body=(
+            json.loads(rendered_event) if target.request.body_format == "json" else None
+        ),
         audio_field=target.request.audio_field if include_audio else None,
         audio_filename=target.request.audio_filename if include_audio else None,
         audio_mime_type=target.request.audio_mime_type if include_audio else None,
     )
+
+
+def parse_target_response(status_code: int, response_text: str) -> dict[str, Any]:
+    """Normalize a successful JSON, text, or empty HTTP response for storage."""
+    if not response_text:
+        return {"status_code": status_code}
+    try:
+        result = json.loads(response_text)
+    except json.JSONDecodeError:
+        return {"status_code": status_code, "text": response_text}
+    if isinstance(result, dict):
+        return result
+    return {"status_code": status_code, "body": result}
 
 
 async def _send_event(
@@ -370,15 +431,19 @@ async def _send_event(
 ) -> dict[str, Any]:
     request = build_target_event_request(target, event, audio_path is not None)
     async with httpx.AsyncClient(timeout=request.timeout_seconds) as client:
-        if audio_path is None or request.audio_field is None:
+        if request.body_format == "json":
             response = await client.post(
-                request.url, data=request.data, headers=request.headers
+                request.url, json=request.json_body, headers=request.headers
+            )
+        elif audio_path is None or request.audio_field is None:
+            response = await client.post(
+                request.url, data=request.form_data, headers=request.headers
             )
         else:
             with audio_path.open("rb") as audio:
                 response = await client.post(
                     request.url,
-                    data=request.data,
+                    data=request.form_data,
                     files={
                         request.audio_field: (
                             request.audio_filename,
@@ -389,10 +454,7 @@ async def _send_event(
                     headers=request.headers,
                 )
         response.raise_for_status()
-        result = response.json()
-        if not isinstance(result, dict):
-            raise ValueError(f"target {target.name} response must be a JSON object")
-        return result
+        return parse_target_response(response.status_code, response.text)
 
 
 def build_target_status_url(target: Target, target_id: str) -> str:
@@ -576,7 +638,8 @@ async def health() -> dict[str, Any]:
         "targets": [
             {
                 "name": target.name,
-                "url": target.url,
+                "url": "<redacted>" if target.is_url_secret else target.url,
+                "body_format": target.request.body_format,
                 "status_tracking": bool(target.status.url_template),
             }
             for target in settings.targets

@@ -57,10 +57,17 @@ can transform it into the structure expected by that receiver.
 
 ## Target interface
 
-The rendered JSON is sent using `multipart/form-data`. Each target configures the JSON
-field name and, for recordings, the audio field name, filename, and media type. The
-target must return a JSON object after accepting the request. No particular event schema
-is imposed on the target because its template defines that schema.
+Each target chooses `multipart` or `json` with `request.body_format`. The default is
+`multipart`: one field contains the rendered JSON and, for recordings, another contains
+the audio file. The target configures both field names as well as the audio filename and
+media type. A `json` target receives the rendered template as its complete JSON request
+body and does not receive the audio attachment. This is useful for notifications and
+other text or metadata-only APIs.
+
+Any successful JSON, text, or empty HTTP response counts as a completed delivery. A
+target that configures status lookup must return a JSON object containing the configured
+ID field. No particular event schema is imposed because each target's template defines
+its request body.
 
 ## Configure
 
@@ -79,8 +86,9 @@ openssl rand -hex 32  # WEBHOOK_TOKEN: configured in Pebble
 openssl rand -hex 32  # for a target's token_env variable, when required
 ```
 
-Keep secrets in `.env` and reference their variable names with `auth.token_env`; avoid
-placing tokens directly in YAML. Do not reuse the public Pebble token for a target.
+Keep secrets in `.env` and reference their variable names with `auth.token_env` or
+`url_env`; avoid placing tokens or credential-bearing URLs directly in YAML. Do not
+reuse the public Pebble token for a target.
 
 ## Target configuration
 
@@ -98,6 +106,7 @@ targets:
       scheme: Bearer
       token_env: RECEIVER_TOKEN
     request:
+      body_format: multipart
       event_field: event
       audio_field: audio
       template: |
@@ -108,8 +117,11 @@ Templates use sandboxed Jinja with strict undefined values and must render valid
 They can select, rename, nest, or omit fields. The `tojson` filter should be used when
 inserting values so strings and nulls remain valid JSON.
 
-Static `headers` may be added to a target. `request` can also set `audio_filename`,
-`audio_mime_type`, and `include_audio`. Status lookup is optional:
+Static `headers` may be added to a target. `request` can also set `body_format`,
+`audio_filename`, `audio_mime_type`, and `include_audio`. JSON requests default to
+`include_audio: false` and reject `include_audio: true`. A target URL that contains a
+credential can be read from an environment variable with `url_env` instead of being
+stored in YAML. Status lookup is optional:
 
 ```yaml
 status:
@@ -124,17 +136,26 @@ Delivery results are saved independently under `metadata.deliveries`. The overal
 status is `forwarded` when all targets succeed, `partial` when some succeed, and `failed`
 when none succeed.
 
-## Personal agent gateway example
+## Audio-capable receiver example
 
-The first entry in `targets.example.yaml` configures the sibling
-`personal-agent-gateway` as one compatible target:
+Suppose an HTTP service accepts a JSON event envelope and an optional audio recording
+in the same `multipart/form-data` request. The adapter can send Pebble recordings to
+that service with a target such as:
 
 ```yaml
-- name: personal-agent-gateway
-  url: http://127.0.0.1:8790/v1/events
+- name: audio-event-receiver
+  url: https://receiver.example.com/events
   auth:
-    token_env: GATEWAY_TOKEN
+    header: Authorization
+    scheme: Bearer
+    token_env: RECEIVER_TOKEN
   request:
+    body_format: multipart
+    event_field: event
+    audio_field: audio
+    audio_filename: index-recording.m4a
+    audio_mime_type: audio/mp4
+    include_audio: true
     template: |
       {
         "event_id": {{ event.event_id | tojson }},
@@ -146,9 +167,57 @@ The first entry in `targets.example.yaml` configures the sibling
         "metadata": {{ event.metadata | tojson }}
       }
   status:
-    url_template: http://127.0.0.1:8790/v1/events/{id}
+    url_template: https://receiver.example.com/events/{id}
     id_field: id
 ```
+
+For a recording, the receiver gets one multipart field named `event` containing the
+rendered JSON and one named `audio` containing the M4A file. The JSON `content` array
+identifies the recording as an audio input and references that multipart attachment:
+
+```json
+{
+  "content": [
+    {
+      "type": "audio",
+      "attachment": "audio",
+      "mime_type": "audio/mp4",
+      "language": "ja"
+    }
+  ]
+}
+```
+
+The receiver may transcribe the recording, store it, or pass it to another system. If
+Pebble supplied its own transcription, it remains available as
+`metadata.input_transcription`; the adapter does not choose which transcription the
+receiver should use. If status lookup is configured, the receiver's POST response must
+include the field named by `id_field`. Otherwise, a successful JSON, text, or empty
+response is accepted.
+
+## Slack receipt notification example
+
+Because targets are independent and receive events concurrently, one target can handle
+the recording while another posts a receipt notification. For example, this JSON target
+can be added alongside the audio receiver above:
+
+```yaml
+- name: slack-receipt
+  url_env: SLACK_WEBHOOK_URL
+  request:
+    body_format: json
+    include_audio: false
+    template: |
+      {
+        "text": {{ ("Pebble input received: " ~ event.event_id) | tojson }}
+      }
+```
+
+Set `SLACK_WEBHOOK_URL` to a Slack Incoming Webhook URL and keep it out of the YAML and
+version control because the URL is a secret. Slack receives a normal JSON request; it
+does not receive the recording. See Slack's
+[Incoming Webhooks documentation](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/)
+for setup and message formatting.
 
 When `TARGETS_CONFIG_PATH` is unset, the previous single-target `TARGET_*` environment
 variables remain supported when no `./targets.yaml` exists. Existing `GATEWAY_URL`,

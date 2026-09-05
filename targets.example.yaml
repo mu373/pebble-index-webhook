@@ -1,16 +1,17 @@
 version: 1
 
 targets:
-  # The personal agent gateway is one implementation of the target contract.
-  - name: personal-agent-gateway
+  # Example receiver that accepts the normalized event and optional audio attachment.
+  - name: audio-event-receiver
     enabled: true
-    url: http://127.0.0.1:8790/v1/events
+    url: https://receiver.example.com/events
     timeout_seconds: 30
     auth:
       header: Authorization
       scheme: Bearer
-      token_env: GATEWAY_TOKEN
+      token_env: RECEIVER_TOKEN
     request:
+      body_format: multipart
       event_field: event
       audio_field: audio
       audio_filename: index-recording.m4a
@@ -27,8 +28,21 @@ targets:
           "metadata": {{ event.metadata | tojson }}
         }
     status:
-      url_template: http://127.0.0.1:8790/v1/events/{id}
+      url_template: https://receiver.example.com/events/{id}
       id_field: id
+
+  # JSON-only targets can receive metadata or notifications without the audio file.
+  # Slack Incoming Webhook URLs are secrets, so load the URL from the environment.
+  - name: slack-receipt
+    enabled: false
+    url_env: SLACK_WEBHOOK_URL
+    request:
+      body_format: json
+      include_audio: false
+      template: |
+        {
+          "text": {{ ("Pebble input received: " ~ event.event_id) | tojson }}
+        }
 
   # Enable this entry to fan the same Pebble event out to another HTTP service.
   - name: example-webhook
@@ -41,6 +55,7 @@ targets:
       scheme: ""
       token_env: EXAMPLE_WEBHOOK_TOKEN
     request:
+      body_format: multipart
       event_field: payload
       audio_field: recording
       audio_filename: pebble-recording.m4a

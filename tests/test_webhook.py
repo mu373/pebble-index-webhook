@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import json
 import time
@@ -63,6 +64,23 @@ def test_gets_public_liveness_without_internal_configuration(monkeypatch, tmp_pa
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_health_does_not_expose_target_url(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+    with TestClient(main.app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["targets"] == [
+        {
+            "name": "default",
+            "url": "<redacted>",
+            "body_format": "multipart",
+            "status_tracking": True,
+        }
+    ]
+    assert "target.test" not in response.text
 
 
 def test_accepts_and_forwards_pebble_audio(monkeypatch, tmp_path):
@@ -372,7 +390,10 @@ def test_builds_target_requests_without_io(monkeypatch, tmp_path):
     assert event_request.url == target.url
     assert event_request.timeout_seconds == 4.5
     assert event_request.headers == {"X-Source": "pebble", "X-Token": "Token secret"}
-    assert json.loads(event_request.data["payload"]) == {"id": "pebble:a/b"}
+    assert event_request.body_format == "multipart"
+    assert event_request.form_data is not None
+    assert json.loads(event_request.form_data["payload"]) == {"id": "pebble:a/b"}
+    assert event_request.json_body is None
     assert event_request.audio_field == "recording"
     assert event_request.audio_filename == "note.m4a"
     assert event_request.audio_mime_type == "audio/x-m4a"
@@ -393,6 +414,93 @@ def test_omits_audio_from_target_request_when_disabled(monkeypatch, tmp_path):
     assert request.audio_field is None
     assert request.audio_filename is None
     assert request.audio_mime_type is None
+
+
+def test_builds_json_target_request_from_environment_url(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+    targets = main.parse_targets_config(
+        {
+            "targets": [
+                {
+                    "name": "notification",
+                    "url_env": "NOTIFICATION_URL",
+                    "request": {
+                        "body_format": "json",
+                        "template": '{"text": {{ event.event_id | tojson }}}',
+                    },
+                }
+            ]
+        },
+        "memory",
+        {"NOTIFICATION_URL": "https://receiver.test/notify"},
+    )
+
+    request = main.build_target_event_request(
+        targets[0], {"event_id": "pebble:one"}, True
+    )
+
+    assert targets[0].url == "https://receiver.test/notify"
+    assert targets[0].request.include_audio is False
+    assert request.body_format == "json"
+    assert request.form_data is None
+    assert request.json_body == {"text": "pebble:one"}
+    assert request.audio_field is None
+
+
+def test_sends_json_and_accepts_text_response(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+    main = importlib.reload(main)
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", FakeAsyncClient)
+    target = main.Target(
+        "notification",
+        "https://receiver.test/notify",
+        request=main.TargetRequest(
+            body_format="json",
+            include_audio=False,
+            event_template='{"text": {{ event.event_id | tojson }}}',
+        ),
+    )
+
+    result = asyncio.run(main._send_event(target, {"event_id": "pebble:one"}, None))
+
+    assert captured["kwargs"]["json"] == {"text": "pebble:one"}
+    assert "data" not in captured["kwargs"]
+    assert result == {"status_code": 200, "text": "ok"}
+
+
+def test_normalizes_empty_and_non_object_target_responses(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+
+    assert main.parse_target_response(204, "") == {"status_code": 204}
+    assert main.parse_target_response(202, '{"id": "one"}') == {"id": "one"}
+    assert main.parse_target_response(200, '["ok"]') == {
+        "status_code": 200,
+        "body": ["ok"],
+    }
 
 
 def test_rejects_invalid_target_template_and_missing_status_url(monkeypatch, tmp_path):
@@ -497,6 +605,50 @@ def test_summarizes_uniform_target_results(
             },
             {},
             "requires environment variable TOKEN",
+        ),
+        (
+            {
+                "targets": [
+                    {
+                        "name": "both-urls",
+                        "url": "http://target.test",
+                        "url_env": "TARGET_URL_SECRET",
+                    }
+                ]
+            },
+            {"TARGET_URL_SECRET": "http://secret.test"},
+            "cannot set both url and url_env",
+        ),
+        (
+            {"targets": [{"name": "secret-url", "url_env": "TARGET_URL_SECRET"}]},
+            {},
+            "requires environment variable TARGET_URL_SECRET",
+        ),
+        (
+            {
+                "targets": [
+                    {
+                        "name": "invalid-body",
+                        "url": "http://target.test",
+                        "request": {"body_format": "xml"},
+                    }
+                ]
+            },
+            {},
+            "body_format must be multipart or json",
+        ),
+        (
+            {
+                "targets": [
+                    {
+                        "name": "json-audio",
+                        "url": "http://target.test",
+                        "request": {"body_format": "json", "include_audio": True},
+                    }
+                ]
+            },
+            {},
+            "cannot include audio with a JSON request",
         ),
         (
             {
