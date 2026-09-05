@@ -343,7 +343,9 @@ def render_target_event(target: Target, event: Mapping[str, Any]) -> str:
     try:
         json.loads(rendered)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"target {target.name} template did not render valid JSON") from exc
+        raise ValueError(
+            f"target {target.name} template did not render valid JSON"
+        ) from exc
     return rendered
 
 
@@ -400,9 +402,7 @@ def build_target_status_url(target: Target, target_id: str) -> str:
     return target.status.url_template.format(id=quote(target_id, safe=""))
 
 
-def build_target_status_request(
-    target: Target, target_id: str
-) -> TargetStatusRequest:
+def build_target_status_request(target: Target, target_id: str) -> TargetStatusRequest:
     """Describe an outbound target status request without performing I/O."""
     return TargetStatusRequest(
         url=build_target_status_url(target, target_id),
@@ -673,7 +673,9 @@ async def index01_webhook(
 ) -> dict[str, Any]:
     _require_webhook_authorization(authorization)
     if audio is None and not transcription:
-        raise HTTPException(status_code=422, detail="audio or transcription is required")
+        raise HTTPException(
+            status_code=422, detail="audio or transcription is required"
+        )
 
     provisional_id = compute_event_id(recorded_at, client, transcription)
     provisional_dir = settings.data_dir / "events" / f".{provisional_id}"
@@ -687,9 +689,7 @@ async def index01_webhook(
                 audio, provisional_dir / "audio.m4a"
             )
 
-        event_id = compute_event_id(
-            recorded_at, client, transcription, audio_sha256
-        )
+        event_id = compute_event_id(recorded_at, client, transcription, audio_sha256)
         event_dir = settings.data_dir / "events" / event_id
         if event_dir.exists():
             _discard_provisional_event(provisional_dir)

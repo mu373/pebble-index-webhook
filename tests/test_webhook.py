@@ -12,9 +12,7 @@ def load_app(monkeypatch, tmp_path):
     monkeypatch.setenv("WEBHOOK_TOKEN", "test-token")
     monkeypatch.setenv("TARGET_TOKEN", "target-test-token")
     monkeypatch.setenv("TARGET_URL", "http://target.test/events")
-    monkeypatch.setenv(
-        "TARGET_STATUS_URL_TEMPLATE", "http://target.test/events/{id}"
-    )
+    monkeypatch.setenv("TARGET_STATUS_URL_TEMPLATE", "http://target.test/events/{id}")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     import app.main
 
@@ -115,9 +113,7 @@ def test_forwards_text_when_audio_is_absent(monkeypatch, tmp_path):
         )
         wait_until_forwarded(client, accepted.json()["event_id"])
 
-    assert captured["event"]["content"] == [
-        {"type": "text", "text": "こんにちは"}
-    ]
+    assert captured["event"]["content"] == [{"type": "text", "text": "こんにちは"}]
     assert captured["audio_path"] is None
 
 
@@ -169,9 +165,7 @@ def test_supports_legacy_gateway_configuration(monkeypatch, tmp_path):
     target = main.settings.targets[0]
     assert target.url == "http://gateway.test/v1/events"
     assert target.auth_token == "legacy-token"
-    assert target.status.url_template == (
-        "http://gateway.test/v1/events/{id}"
-    )
+    assert target.status.url_template == ("http://gateway.test/v1/events/{id}")
 
 
 def test_forwards_to_multiple_yaml_targets_with_custom_templates(monkeypatch, tmp_path):
@@ -262,9 +256,7 @@ def test_pure_event_builders_are_deterministic(monkeypatch, tmp_path):
         audio_sha256="abc",
     )
 
-    assert event_id == main.compute_event_id(
-        "1787752800000", "ring", "hello", "abc"
-    )
+    assert event_id == main.compute_event_id("1787752800000", "ring", "hello", "abc")
     assert metadata["event_id"] == event_id
     assert metadata["pebble_transcription"] == "hello"
 
