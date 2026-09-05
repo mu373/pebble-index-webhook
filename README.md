@@ -136,7 +136,9 @@ Delivery results are saved independently under `metadata.deliveries`. The overal
 status is `forwarded` when all targets succeed, `partial` when some succeed, and `failed`
 when none succeed.
 
-## Audio-capable receiver example
+## Examples
+
+### Audio-capable receiver
 
 Suppose an HTTP service accepts a JSON event envelope and an optional audio recording
 in the same `multipart/form-data` request. The adapter can send Pebble recordings to
@@ -195,7 +197,7 @@ receiver should use. If status lookup is configured, the receiver's POST respons
 include the field named by `id_field`. Otherwise, a successful JSON, text, or empty
 response is accepted.
 
-## Slack receipt notification example
+### Slack receipt notification
 
 Because targets are independent and receive events concurrently, one target can handle
 the recording while another posts a receipt notification. For example, this JSON target
