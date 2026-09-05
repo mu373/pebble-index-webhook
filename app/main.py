@@ -81,18 +81,6 @@ class TargetStatusRequest:
     headers: dict[str, str]
 
 
-def _legacy_target_url() -> str:
-    gateway_url = os.getenv("GATEWAY_URL", "").rstrip("/")
-    return f"{gateway_url}/v1/events" if gateway_url else ""
-
-
-def _legacy_status_url_template() -> str:
-    if os.getenv("TARGET_URL"):
-        return ""
-    gateway_url = os.getenv("GATEWAY_URL", "").rstrip("/")
-    return f"{gateway_url}/v1/events/{{id}}" if gateway_url else ""
-
-
 def _require_mapping(value: Any, location: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -209,7 +197,7 @@ def _load_yaml_targets(path: Path) -> tuple[Target, ...]:
 
 
 def _environment_target() -> tuple[Target, ...]:
-    url = os.getenv("TARGET_URL", _legacy_target_url())
+    url = os.getenv("TARGET_URL", "")
     if not url:
         return ()
     body_format = _require_body_format(
@@ -224,15 +212,10 @@ def _environment_target() -> tuple[Target, ...]:
         Target(
             name=os.getenv("TARGET_NAME", "default"),
             url=url,
-            timeout_seconds=float(
-                os.getenv(
-                    "TARGET_TIMEOUT_SECONDS",
-                    os.getenv("GATEWAY_TIMEOUT_SECONDS", "30"),
-                )
-            ),
+            timeout_seconds=float(os.getenv("TARGET_TIMEOUT_SECONDS", "30")),
             auth_header=os.getenv("TARGET_AUTH_HEADER", "Authorization"),
             auth_scheme=os.getenv("TARGET_AUTH_SCHEME", "Bearer"),
-            auth_token=os.getenv("TARGET_TOKEN", os.getenv("GATEWAY_TOKEN", "")),
+            auth_token=os.getenv("TARGET_TOKEN", ""),
             request=TargetRequest(
                 body_format=body_format,
                 event_field=os.getenv("TARGET_EVENT_FIELD", "event"),
@@ -247,9 +230,7 @@ def _environment_target() -> tuple[Target, ...]:
                 ),
             ),
             status=TargetStatus(
-                url_template=os.getenv(
-                    "TARGET_STATUS_URL_TEMPLATE", _legacy_status_url_template()
-                ),
+                url_template=os.getenv("TARGET_STATUS_URL_TEMPLATE", ""),
                 id_field=os.getenv("TARGET_ID_FIELD", "id"),
             ),
             is_url_secret=True,
@@ -258,9 +239,13 @@ def _environment_target() -> tuple[Target, ...]:
 
 
 def _targets_config_path() -> Path | None:
-    config_path = os.getenv("TARGETS_CONFIG_PATH", "").strip()
-    if config_path:
-        return Path(config_path)
+    configured_path = os.getenv("TARGETS_CONFIG_PATH")
+    if configured_path is not None:
+        configured_path = configured_path.strip()
+        if configured_path == "-":
+            return None
+        if configured_path:
+            return Path(configured_path)
     default_path = Path("./targets.yaml")
     return default_path if default_path.is_file() else None
 
@@ -276,8 +261,8 @@ class Settings:
     targets_config_path: str = str(_targets_config_path() or "")
     targets: tuple[Target, ...] = _load_targets()
     sender_id: str = os.getenv("PEBBLE_SENDER_ID", "")
-    conversation_id: str = os.getenv("PEBBLE_CONVERSATION_ID", "personal")
-    language_hint: str = os.getenv("PEBBLE_LANGUAGE_HINT", "ja")
+    conversation_id: str = os.getenv("PEBBLE_CONVERSATION_ID", "default")
+    language_hint: str = os.getenv("PEBBLE_LANGUAGE_HINT", "")
     data_dir: Path = Path(os.getenv("DATA_DIR", "./data"))
     max_audio_bytes: int = int(os.getenv("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
     workers: int = int(os.getenv("WORKERS", "1"))
@@ -523,20 +508,6 @@ def find_target_status_lookups(
     return tuple(lookups)
 
 
-def find_legacy_target_status_lookup(
-    targets: tuple[Target, ...], metadata: Mapping[str, Any]
-) -> TargetStatusLookup | None:
-    """Find a status lookup in metadata written by a pre-multi-target adapter."""
-    old_target_response = metadata.get("target") or metadata.get("gateway", {})
-    if not old_target_response or not targets:
-        return None
-    target = targets[0]
-    target_id = old_target_response.get(target.status.id_field)
-    if not target_id or not target.status.url_template:
-        return None
-    return TargetStatusLookup(target.name, target, str(target_id))
-
-
 async def _forward_event_to_targets(local_event_id: str) -> None:
     event_dir = settings.data_dir / "events" / local_event_id
     metadata_path = event_dir / "metadata.json"
@@ -583,8 +554,6 @@ async def _forward_event_to_targets(local_event_id: str) -> None:
             settings.targets, results
         )
         metadata["deliveries"] = deliveries
-        metadata.pop("target", None)
-        metadata.pop("gateway", None)
         metadata["status"] = delivery_status
         if delivery_error is None:
             metadata.pop("error", None)
@@ -678,15 +647,6 @@ async def event_status(
     if target_events:
         response["target_events"] = target_events
 
-    # Read single-target metadata saved by earlier versions of the adapter.
-    legacy_lookup = find_legacy_target_status_lookup(settings.targets, metadata)
-    if legacy_lookup is not None:
-        try:
-            response["target_event"] = await _fetch_target_event_status(
-                legacy_lookup.target, legacy_lookup.target_id
-            )
-        except Exception as exc:
-            response["target_error"] = str(exc)
     return response
 
 

@@ -15,6 +15,8 @@ def load_app(monkeypatch, tmp_path):
     monkeypatch.setenv("TARGET_URL", "http://target.test/events")
     monkeypatch.setenv("TARGET_STATUS_URL_TEMPLATE", "http://target.test/events/{id}")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PEBBLE_CONVERSATION_ID", "default")
+    monkeypatch.setenv("PEBBLE_LANGUAGE_HINT", "")
     import app.main
 
     main = importlib.reload(app.main)
@@ -117,7 +119,7 @@ def test_accepts_and_forwards_pebble_audio(monkeypatch, tmp_path):
             "type": "audio",
             "attachment": "audio",
             "mime_type": "audio/mp4",
-            "language": "ja",
+            "language": None,
         }
     ]
     assert captured["event"]["metadata"]["input_transcription"] == (
@@ -174,25 +176,6 @@ def test_deduplicates_retries(monkeypatch, tmp_path):
         second = client.post("/webhooks/index01", **request)
     assert first.status_code == 202
     assert second.json()["status"] == "duplicate"
-
-
-def test_supports_legacy_gateway_configuration(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TARGETS_CONFIG_PATH", raising=False)
-    monkeypatch.delenv("TARGET_URL", raising=False)
-    monkeypatch.delenv("TARGET_TOKEN", raising=False)
-    monkeypatch.delenv("TARGET_STATUS_URL_TEMPLATE", raising=False)
-    monkeypatch.setenv("GATEWAY_URL", "http://gateway.test")
-    monkeypatch.setenv("GATEWAY_TOKEN", "legacy-token")
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    import app.main
-
-    main = importlib.reload(app.main)
-
-    target = main.settings.targets[0]
-    assert target.url == "http://gateway.test/v1/events"
-    assert target.auth_token == "legacy-token"
-    assert target.status.url_template == ("http://gateway.test/v1/events/{id}")
 
 
 def test_forwards_to_multiple_yaml_targets_with_custom_templates(monkeypatch, tmp_path):
@@ -311,14 +294,14 @@ def test_parses_targets_without_reading_process_environment(monkeypatch, tmp_pat
         {
             "targets": [
                 {
-                    "name": "gateway",
-                    "url": "http://gateway.test/events",
-                    "auth": {"token_env": "GATEWAY_TOKEN"},
+                    "name": "receiver",
+                    "url": "http://receiver.test/events",
+                    "auth": {"token_env": "RECEIVER_TOKEN"},
                 }
             ]
         },
         "memory",
-        {"GATEWAY_TOKEN": "provided"},
+        {"RECEIVER_TOKEN": "provided"},
     )
 
     assert targets[0].auth_token == "provided"
@@ -517,7 +500,7 @@ def test_rejects_invalid_target_template_and_missing_status_url(monkeypatch, tmp
         main.build_target_status_request(invalid_template, "id")
 
 
-def test_finds_current_and_legacy_status_lookups(monkeypatch, tmp_path):
+def test_finds_current_status_lookups(monkeypatch, tmp_path):
     main, _ = load_app(monkeypatch, tmp_path)
     tracked = main.Target(
         "tracked",
@@ -532,19 +515,28 @@ def test_finds_current_and_legacy_status_lookups(monkeypatch, tmp_path):
             "untracked": {"response": {"id": "ignored"}},
             "removed": {"response": {"id": "ignored"}},
         },
-        "gateway": {"event_id": "legacy/id"},
     }
 
     lookups = main.find_target_status_lookups(targets, metadata)
-    legacy = main.find_legacy_target_status_lookup(targets, metadata)
 
     assert [(lookup.name, lookup.target_id) for lookup in lookups] == [
         ("tracked", "42")
     ]
-    assert legacy is not None
-    assert legacy.target is tracked
-    assert legacy.target_id == "legacy/id"
-    assert main.find_legacy_target_status_lookup((), metadata) is None
+
+
+def test_disables_default_yaml_config_with_dash(monkeypatch, tmp_path):
+    (tmp_path / "targets.yaml").write_text("invalid: true\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TARGETS_CONFIG_PATH", "-")
+    monkeypatch.setenv("TARGET_URL", "http://receiver.test/events")
+    monkeypatch.setenv("TARGET_TOKEN", "target-token")
+    import app.main
+
+    main = importlib.reload(app.main)
+
+    assert [target.url for target in main.settings.targets] == [
+        "http://receiver.test/events"
+    ]
 
 
 @pytest.mark.parametrize(

@@ -28,8 +28,8 @@ Authorization: Bearer <WEBHOOK_TOKEN>
 The adapter immediately returns `202` after durable local acceptance. Its worker sends
 the event concurrently to every enabled target in `targets.yaml`. Each target controls
 its URL, authentication, headers, multipart field names, JSON template, and optional
-status lookup. An audio event defaults to the Japanese language hint `ja`;
-`PEBBLE_LANGUAGE_HINT` can override or disable it.
+status lookup. `PEBBLE_LANGUAGE_HINT` can add an optional ISO language hint to audio
+events.
 
 ## Template input
 
@@ -40,7 +40,7 @@ Before rendering a target-specific payload, the adapter constructs this canonica
   "event_id": "pebble_index:<local-id>",
   "source": "pebble_index",
   "sender_id": "<configured sender or Pebble client>",
-  "conversation_id": "personal",
+  "conversation_id": "default",
   "content": [{"type": "text", "text": "example"}],
   "reply": {"adapter": "pebble_index", "target": "<local-id>"},
   "metadata": {
@@ -184,7 +184,7 @@ identifies the recording as an audio input and references that multipart attachm
       "type": "audio",
       "attachment": "audio",
       "mime_type": "audio/mp4",
-      "language": "ja"
+      "language": null
     }
   ]
 }
@@ -221,10 +221,9 @@ does not receive the recording. See Slack's
 [Incoming Webhooks documentation](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/)
 for setup and message formatting.
 
-When `TARGETS_CONFIG_PATH` is unset, the previous single-target `TARGET_*` environment
-variables remain supported when no `./targets.yaml` exists. Existing `GATEWAY_URL`,
-`GATEWAY_TOKEN`, and `GATEWAY_TIMEOUT_SECONDS` deployments also remain compatible;
-`GATEWAY_URL` is treated as a base URL and expanded to `/v1/events`.
+When `TARGETS_CONFIG_PATH` is unset and no `./targets.yaml` exists, a single target can
+instead be configured with the `TARGET_*` environment variables. Set
+`TARGETS_CONFIG_PATH=-` to select those variables even when `./targets.yaml` exists.
 
 ## Inspect an event
 
