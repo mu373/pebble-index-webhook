@@ -504,7 +504,7 @@ async def _forward_event_to_targets(local_event_id: str) -> None:
             ),
             return_exceptions=True,
         )
-        for target, result in zip(settings.targets, results):
+        for target, result in zip(settings.targets, results, strict=True):
             if isinstance(result, BaseException):
                 logger.error(
                     "failed to forward event %s to %s", local_event_id, target.name

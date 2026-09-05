@@ -16,6 +16,7 @@ dependencies = [
 dev = [
   "pytest>=8.4,<10",
   "pytest-cov>=7,<8",
+  "ruff>=0.15,<0.16",
 ]
 
 [tool.pytest.ini_options]
@@ -28,6 +29,25 @@ source = ["app"]
 
 [tool.coverage.report]
 show_missing = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "SIM", "C90", "PLR0912", "PLR0915"]
+# FastAPI intentionally declares dependency metadata through calls in defaults.
+ignore = ["B008"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["C901", "PLR0912", "PLR0915"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
