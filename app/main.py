@@ -52,6 +52,31 @@ class Target:
     status: TargetStatus = TargetStatus()
 
 
+@dataclass(frozen=True)
+class TargetEventRequest:
+    url: str
+    timeout_seconds: float
+    headers: dict[str, str]
+    data: dict[str, str]
+    audio_field: str | None
+    audio_filename: str | None
+    audio_mime_type: str | None
+
+
+@dataclass(frozen=True)
+class TargetStatusLookup:
+    name: str
+    target: Target
+    target_id: str
+
+
+@dataclass(frozen=True)
+class TargetStatusRequest:
+    url: str
+    timeout_seconds: float
+    headers: dict[str, str]
+
+
 def _legacy_target_url() -> str:
     gateway_url = os.getenv("GATEWAY_URL", "").rstrip("/")
     return f"{gateway_url}/v1/events" if gateway_url else ""
@@ -263,16 +288,23 @@ async def _save_audio(upload: UploadFile, destination: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
-def _normalize_event(
-    local_event_id: str, metadata: dict[str, Any], has_audio: bool
+def build_normalized_event(
+    local_event_id: str,
+    metadata: Mapping[str, Any],
+    has_audio: bool,
+    *,
+    sender_id: str,
+    conversation_id: str,
+    language_hint: str,
 ) -> dict[str, Any]:
+    """Build the target-neutral event without reading runtime state."""
     if has_audio:
         content = [
             {
                 "type": "audio",
                 "attachment": "audio",
                 "mime_type": "audio/mp4",
-                "language": settings.language_hint or None,
+                "language": language_hint or None,
             }
         ]
     else:
@@ -281,8 +313,8 @@ def _normalize_event(
     return {
         "event_id": f"pebble_index:{local_event_id}",
         "source": "pebble_index",
-        "sender_id": settings.sender_id or metadata["client"],
-        "conversation_id": settings.conversation_id,
+        "sender_id": sender_id or metadata["client"],
+        "conversation_id": conversation_id,
         "content": content,
         "reply": {"adapter": "pebble_index", "target": local_event_id},
         "metadata": {
@@ -294,7 +326,8 @@ def _normalize_event(
     }
 
 
-def _target_headers(target: Target) -> dict[str, str]:
+def build_target_headers(target: Target) -> dict[str, str]:
+    """Build target headers without mutating target configuration."""
     headers = dict(target.headers or {})
     if target.auth_token:
         value = f"{target.auth_scheme} {target.auth_token}".strip()
@@ -302,7 +335,8 @@ def _target_headers(target: Target) -> dict[str, str]:
     return headers
 
 
-def _render_event(target: Target, event: dict[str, Any]) -> str:
+def render_target_event(target: Target, event: Mapping[str, Any]) -> str:
+    """Render and validate the target-specific event payload."""
     rendered = template_environment.from_string(target.request.event_template).render(
         event=event
     )
@@ -313,27 +347,44 @@ def _render_event(target: Target, event: dict[str, Any]) -> str:
     return rendered
 
 
+def build_target_event_request(
+    target: Target, event: Mapping[str, Any], has_audio: bool
+) -> TargetEventRequest:
+    """Describe an outbound target request without performing I/O."""
+    include_audio = has_audio and target.request.include_audio
+    return TargetEventRequest(
+        url=target.url,
+        timeout_seconds=target.timeout_seconds,
+        headers=build_target_headers(target),
+        data={target.request.event_field: render_target_event(target, event)},
+        audio_field=target.request.audio_field if include_audio else None,
+        audio_filename=target.request.audio_filename if include_audio else None,
+        audio_mime_type=target.request.audio_mime_type if include_audio else None,
+    )
+
+
 async def _send_event(
     target: Target, event: dict[str, Any], audio_path: Path | None
 ) -> dict[str, Any]:
-    headers = _target_headers(target)
-    data = {target.request.event_field: _render_event(target, event)}
-    async with httpx.AsyncClient(timeout=target.timeout_seconds) as client:
-        if audio_path is None or not target.request.include_audio:
-            response = await client.post(target.url, data=data, headers=headers)
+    request = build_target_event_request(target, event, audio_path is not None)
+    async with httpx.AsyncClient(timeout=request.timeout_seconds) as client:
+        if audio_path is None or request.audio_field is None:
+            response = await client.post(
+                request.url, data=request.data, headers=request.headers
+            )
         else:
             with audio_path.open("rb") as audio:
                 response = await client.post(
-                    target.url,
-                    data=data,
+                    request.url,
+                    data=request.data,
                     files={
-                        target.request.audio_field: (
-                            target.request.audio_filename,
+                        request.audio_field: (
+                            request.audio_filename,
                             audio,
-                            target.request.audio_mime_type,
+                            request.audio_mime_type,
                         )
                     },
-                    headers=headers,
+                    headers=request.headers,
                 )
         response.raise_for_status()
         result = response.json()
@@ -342,15 +393,30 @@ async def _send_event(
         return result
 
 
-async def _fetch_target_event_status(target: Target, target_id: str) -> dict[str, Any]:
+def build_target_status_url(target: Target, target_id: str) -> str:
+    """Build a safely encoded status URL from target configuration."""
     if not target.status.url_template:
-        raise RuntimeError(f"target {target.name} does not configure status lookup")
-    encoded_id = quote(target_id, safe="")
-    status_url = target.status.url_template.format(id=encoded_id)
-    async with httpx.AsyncClient(timeout=target.timeout_seconds) as client:
+        raise ValueError(f"target {target.name} does not configure status lookup")
+    return target.status.url_template.format(id=quote(target_id, safe=""))
+
+
+def build_target_status_request(
+    target: Target, target_id: str
+) -> TargetStatusRequest:
+    """Describe an outbound target status request without performing I/O."""
+    return TargetStatusRequest(
+        url=build_target_status_url(target, target_id),
+        timeout_seconds=target.timeout_seconds,
+        headers=build_target_headers(target),
+    )
+
+
+async def _fetch_target_event_status(target: Target, target_id: str) -> dict[str, Any]:
+    request = build_target_status_request(target, target_id)
+    async with httpx.AsyncClient(timeout=request.timeout_seconds) as client:
         response = await client.get(
-            status_url,
-            headers=_target_headers(target),
+            request.url,
+            headers=request.headers,
         )
         response.raise_for_status()
         result = response.json()
@@ -378,6 +444,37 @@ def summarize_target_deliveries(
     return deliveries, "partial", f"{failed} target deliveries failed"
 
 
+def find_target_status_lookups(
+    targets: tuple[Target, ...], metadata: Mapping[str, Any]
+) -> tuple[TargetStatusLookup, ...]:
+    """Find configured status lookups represented by stored deliveries."""
+    targets_by_name = {target.name: target for target in targets}
+    lookups = []
+    for name, delivery in metadata.get("deliveries", {}).items():
+        target = targets_by_name.get(name)
+        if target is None or not target.status.url_template:
+            continue
+        target_response = delivery.get("response", {})
+        target_id = target_response.get(target.status.id_field)
+        if target_id:
+            lookups.append(TargetStatusLookup(name, target, str(target_id)))
+    return tuple(lookups)
+
+
+def find_legacy_target_status_lookup(
+    targets: tuple[Target, ...], metadata: Mapping[str, Any]
+) -> TargetStatusLookup | None:
+    """Find a status lookup in metadata written by a pre-multi-target adapter."""
+    old_target_response = metadata.get("target") or metadata.get("gateway", {})
+    if not old_target_response or not targets:
+        return None
+    target = targets[0]
+    target_id = old_target_response.get(target.status.id_field)
+    if not target_id or not target.status.url_template:
+        return None
+    return TargetStatusLookup(target.name, target, str(target_id))
+
+
 async def _forward_event_to_targets(local_event_id: str) -> None:
     event_dir = settings.data_dir / "events" / local_event_id
     metadata_path = event_dir / "metadata.json"
@@ -388,7 +485,14 @@ async def _forward_event_to_targets(local_event_id: str) -> None:
         if not settings.targets:
             raise RuntimeError("no targets are configured")
         audio_path = event_dir / "audio.m4a"
-        event = _normalize_event(local_event_id, metadata, audio_path.exists())
+        event = build_normalized_event(
+            local_event_id,
+            metadata,
+            audio_path.exists(),
+            sender_id=settings.sender_id,
+            conversation_id=settings.conversation_id,
+            language_hint=settings.language_hint,
+        )
         results = await asyncio.gather(
             *(
                 _send_event(
@@ -495,37 +599,26 @@ async def event_status(
         raise HTTPException(status_code=404, detail="event not found")
     metadata = _read_json(metadata_path)
     response: dict[str, Any] = {"metadata": metadata}
-    targets_by_name = {target.name: target for target in settings.targets}
     target_events: dict[str, Any] = {}
-    for name, delivery in metadata.get("deliveries", {}).items():
-        target = targets_by_name.get(name)
-        target_response = delivery.get("response", {})
-        if target is None or not target.status.url_template:
-            continue
-        target_id = target_response.get(target.status.id_field)
-        if not target_id:
-            continue
+    for lookup in find_target_status_lookups(settings.targets, metadata):
         try:
-            target_events[name] = await _fetch_target_event_status(
-                target, str(target_id)
+            target_events[lookup.name] = await _fetch_target_event_status(
+                lookup.target, lookup.target_id
             )
         except Exception as exc:
-            target_events[name] = {"error": str(exc)}
+            target_events[lookup.name] = {"error": str(exc)}
     if target_events:
         response["target_events"] = target_events
 
     # Read single-target metadata saved by earlier versions of the adapter.
-    old_target_response = metadata.get("target") or metadata.get("gateway", {})
-    if old_target_response and settings.targets:
-        target = settings.targets[0]
-        target_id = old_target_response.get(target.status.id_field)
-        if target_id and target.status.url_template:
-            try:
-                response["target_event"] = await _fetch_target_event_status(
-                    target, str(target_id)
-                )
-            except Exception as exc:
-                response["target_error"] = str(exc)
+    legacy_lookup = find_legacy_target_status_lookup(settings.targets, metadata)
+    if legacy_lookup is not None:
+        try:
+            response["target_event"] = await _fetch_target_event_status(
+                legacy_lookup.target, legacy_lookup.target_id
+            )
+        except Exception as exc:
+            response["target_error"] = str(exc)
     return response
 
 
