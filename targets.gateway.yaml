@@ -1,0 +1,20 @@
+version: 1
+
+targets:
+  - name: personal-agent-gateway
+    enabled: true
+    protocol: gateway_channel_v1
+    url: http://agent-gateway:8790
+    timeout_seconds: 30
+    auth:
+      header: Authorization
+      scheme: Bearer
+      token_env: PEBBLE_CHANNEL_TOKEN
+    channel:
+      reply_binding_ref_env: PEBBLE_REPLY_BINDING_REF
+    artifact_provider:
+      url: http://artifact-provider:8796
+      provider_id: artifacts
+      token_env: ARTIFACT_PROVIDER_PEBBLE_TOKEN
+    status:
+      id_field: event_id

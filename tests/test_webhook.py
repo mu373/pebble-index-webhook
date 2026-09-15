@@ -307,6 +307,141 @@ def test_parses_targets_without_reading_process_environment(monkeypatch, tmp_pat
     assert targets[0].auth_token == "provided"
 
 
+def test_sends_pebble_audio_through_channel_and_artifact_grants(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+    reply_ref = "a" * 64
+    target = main.parse_targets_config(
+        {
+            "targets": [
+                {
+                    "name": "gateway",
+                    "protocol": "gateway_channel_v1",
+                    "url": "http://gateway.test",
+                    "auth": {"token_env": "CHANNEL_TOKEN"},
+                    "channel": {"reply_binding_ref_env": "REPLY_REF"},
+                    "artifact_provider": {
+                        "url": "http://artifacts.test",
+                        "token_env": "ARTIFACT_TOKEN",
+                    },
+                    "status": {"id_field": "event_id"},
+                }
+            ]
+        },
+        "memory",
+        {
+            "CHANNEL_TOKEN": "channel-token",
+            "REPLY_REF": reply_ref,
+            "ARTIFACT_TOKEN": "artifact-token",
+        },
+    )[0]
+    audio_path = tmp_path / "audio.m4a"
+    audio_path.write_bytes(b"audio")
+    digest = main.hashlib.sha256(b"audio").hexdigest()
+    registration = {
+        "protocol_version": "1",
+        "registration_id": "registration",
+        "binding": {},
+        "filename": "index-recording.m4a",
+        "mime_type": "audio/mp4",
+        "size": 5,
+        "sha256": digest,
+    }
+    artifact = {
+        "provider_id": "artifacts",
+        "artifact_id": "artifact-reference",
+        "artifact_revision": digest,
+        "registration_receipt_ref": "b" * 32,
+        "registration": registration,
+    }
+    requests = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            if url.endswith("channel-session-bindings"):
+                return Response({"binding_ref": "c" * 64})
+            if url.endswith("reply-associations"):
+                return Response({"protocol_version": "1"})
+            if url.endswith("channel-input-artifact-grants"):
+                return Response({"protocol_version": "1", "registration": registration})
+            if url.endswith("/v1/artifacts"):
+                return Response({"protocol_version": "1", "artifact": artifact})
+            return Response(
+                {
+                    "protocol_version": "1",
+                    "status": "accepted",
+                    "event_id": "pebble_index:event",
+                    "turn_id": "d" * 64,
+                }
+            )
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    event = {
+        "event_id": "pebble_index:event",
+        "sender_id": "ring",
+        "conversation_id": "personal",
+        "content": [{"type": "audio", "attachment": "audio"}],
+    }
+
+    result = asyncio.run(main._send_gateway_channel_input(target, event, audio_path))
+
+    assert result["channel_session_ref"] == "c" * 64
+    assert [url for url, _ in requests] == [
+        "http://gateway.test/v1/channel-session-bindings",
+        f"http://gateway.test/v1/channel-session-bindings/{'c' * 64}/reply-associations",
+        "http://gateway.test/v1/channel-input-artifact-grants",
+        "http://artifacts.test/v1/artifacts",
+        "http://gateway.test/v1/channel-inputs",
+    ]
+    assert requests[1][1]["json"]["reply_binding_ref"] == reply_ref
+    assert requests[3][1]["content"] == b"audio"
+    assert requests[4][1]["json"]["content"] == [
+        {"type": "audio", "artifact": artifact}
+    ]
+
+
+def test_builds_channel_status_request_from_saved_binding(monkeypatch, tmp_path):
+    main, _ = load_app(monkeypatch, tmp_path)
+    target = main.Target(
+        "gateway",
+        "http://gateway.test",
+        auth_token="channel-token",
+        protocol="gateway_channel_v1",
+        reply_binding_ref="a" * 64,
+    )
+
+    request = main.build_target_status_request(target, "pebble_index:event", "b" * 64)
+
+    assert request.method == "POST"
+    assert request.url == "http://gateway.test/v1/channel-inputs/status"
+    assert request.json_body == {
+        "protocol_version": "1",
+        "event_id": "pebble_index:event",
+        "channel_session_ref": "b" * 64,
+        "after_sequence": -1,
+        "after_attempt_id": None,
+    }
+
+
 def test_builds_normalized_events_from_explicit_values(monkeypatch, tmp_path):
     main, _ = load_app(monkeypatch, tmp_path)
     metadata = {

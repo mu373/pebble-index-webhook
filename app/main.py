@@ -52,6 +52,11 @@ class Target:
     request: TargetRequest = TargetRequest()
     status: TargetStatus = TargetStatus()
     is_url_secret: bool = False
+    protocol: Literal["generic", "gateway_channel_v1"] = "generic"
+    reply_binding_ref: str = ""
+    artifact_provider_url: str = ""
+    artifact_provider_id: str = "artifacts"
+    artifact_provider_token: str = ""
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,7 @@ class TargetStatusLookup:
     name: str
     target: Target
     target_id: str
+    channel_session_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,8 @@ class TargetStatusRequest:
     url: str
     timeout_seconds: float
     headers: dict[str, str]
+    method: Literal["GET", "POST"] = "GET"
+    json_body: dict[str, Any] | None = None
 
 
 def _require_mapping(value: Any, location: str) -> dict[str, Any]:
@@ -101,6 +109,63 @@ def _require_body_format(value: Any, location: str) -> Literal["multipart", "jso
     return value
 
 
+def _parse_channel_target_config(
+    item: Mapping[str, Any], name: str, environment: Mapping[str, str]
+) -> tuple[str, str, str, str]:
+    channel = _require_mapping(item.get("channel"), f"target {name}.channel")
+    provider = _require_mapping(
+        item.get("artifact_provider"), f"target {name}.artifact_provider"
+    )
+    reply_ref = str(channel.get("reply_binding_ref", "")).strip()
+    reply_ref_env = str(channel.get("reply_binding_ref_env", "")).strip()
+    if reply_ref and reply_ref_env:
+        raise ValueError(f"target {name} cannot set two reply binding sources")
+    if reply_ref_env:
+        reply_ref = environment.get(reply_ref_env, "").strip()
+    provider_token = str(provider.get("token", ""))
+    provider_token_env = str(provider.get("token_env", "")).strip()
+    if provider_token and provider_token_env:
+        raise ValueError(f"target {name} cannot set two artifact tokens")
+    if provider_token_env:
+        provider_token = environment.get(provider_token_env, "")
+    return (
+        reply_ref,
+        str(provider.get("url", "")).rstrip("/"),
+        str(provider.get("provider_id", "artifacts")),
+        provider_token,
+    )
+
+
+def _require_target_protocol(
+    value: Any, location: str
+) -> Literal["generic", "gateway_channel_v1"]:
+    if value not in {"generic", "gateway_channel_v1"}:
+        raise ValueError(f"{location} is unsupported")
+    return value
+
+
+def _validate_channel_target(
+    name: str,
+    protocol: str,
+    token: str,
+    reply_ref: str,
+    provider_url: str,
+    provider_token: str,
+) -> None:
+    if protocol != "gateway_channel_v1":
+        return
+    if (
+        len(reply_ref) != 64
+        or any(character not in "0123456789abcdef" for character in reply_ref)
+        or not token
+        or not provider_url
+        or not provider_token
+    ):
+        raise ValueError(
+            f"target {name} requires Channel credentials and reply binding"
+        )
+
+
 def _parse_target(
     value: Any, index: int, environment: Mapping[str, str]
 ) -> Target | None:
@@ -108,6 +173,9 @@ def _parse_target(
     if not _require_boolean(item.get("enabled", True), f"targets[{index}].enabled"):
         return None
     name = str(item.get("name", "")).strip()
+    protocol = _require_target_protocol(
+        str(item.get("protocol", "generic")).strip(), f"targets[{index}].protocol"
+    )
     url = str(item.get("url", "")).strip()
     url_env = str(item.get("url_env", "")).strip()
     if not name or (not url and not url_env):
@@ -130,6 +198,17 @@ def _parse_target(
     header_values = _require_mapping(item.get("headers"), f"targets[{index}].headers")
     request = _require_mapping(item.get("request"), f"targets[{index}].request")
     status_config = _require_mapping(item.get("status"), f"targets[{index}].status")
+    reply_binding_ref, provider_url, provider_id, provider_token = (
+        _parse_channel_target_config(item, name, environment)
+    )
+    _validate_channel_target(
+        name,
+        protocol,
+        token,
+        reply_binding_ref,
+        provider_url,
+        provider_token,
+    )
     body_format = _require_body_format(
         request.get("body_format", "multipart"),
         f"targets[{index}].request.body_format",
@@ -162,6 +241,11 @@ def _parse_target(
             id_field=str(status_config.get("id_field", "id")),
         ),
         is_url_secret=bool(url_env),
+        protocol=protocol,
+        reply_binding_ref=reply_binding_ref,
+        artifact_provider_url=provider_url,
+        artifact_provider_id=provider_id,
+        artifact_provider_token=provider_token,
     )
 
 
@@ -414,6 +498,8 @@ def parse_target_response(status_code: int, response_text: str) -> dict[str, Any
 async def _send_event(
     target: Target, event: dict[str, Any], audio_path: Path | None
 ) -> dict[str, Any]:
+    if target.protocol == "gateway_channel_v1":
+        return await _send_gateway_channel_input(target, event, audio_path)
     request = build_target_event_request(target, event, audio_path is not None)
     async with httpx.AsyncClient(timeout=request.timeout_seconds) as client:
         if request.body_format == "json":
@@ -442,6 +528,119 @@ async def _send_event(
         return parse_target_response(response.status_code, response.text)
 
 
+def _require_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+async def _send_gateway_channel_input(
+    target: Target, event: dict[str, Any], audio_path: Path | None
+) -> dict[str, Any]:
+    """Admit one Pebble event through the authenticated Channel boundary."""
+    headers = build_target_headers(target)
+    gateway_url = target.url.rstrip("/")
+    binding_payload = {
+        "protocol_version": "1",
+        "external_actor_id": event["sender_id"],
+        "external_session_id": event["conversation_id"],
+        "target": event["conversation_id"],
+        "thread_id": None,
+    }
+    async with httpx.AsyncClient(timeout=target.timeout_seconds) as client:
+        binding_response = await client.post(
+            f"{gateway_url}/v1/channel-session-bindings",
+            headers=headers,
+            json=binding_payload,
+        )
+        binding_response.raise_for_status()
+        binding = _require_object(binding_response.json(), "Channel binding")
+        binding_ref = binding.get("binding_ref")
+        if not isinstance(binding_ref, str):
+            raise ValueError("Channel binding is missing binding_ref")
+        association_response = await client.post(
+            f"{gateway_url}/v1/channel-session-bindings/{binding_ref}/reply-associations",
+            headers=headers,
+            json={
+                "protocol_version": "1",
+                "reply_binding_ref": target.reply_binding_ref,
+            },
+        )
+        association_response.raise_for_status()
+
+        content = event["content"]
+        if audio_path is not None:
+            if not target.artifact_provider_url or not target.artifact_provider_token:
+                raise RuntimeError("artifact provider is required for Pebble audio")
+            audio = audio_path.read_bytes()
+            digest = hashlib.sha256(audio).hexdigest()
+            registration_id = hashlib.sha256(
+                f"pebble-channel-input:1:{event['event_id']}:audio:0".encode()
+            ).hexdigest()
+            grant_response = await client.post(
+                f"{gateway_url}/v1/channel-input-artifact-grants",
+                headers=headers,
+                json={
+                    "protocol_version": "1",
+                    "event_id": event["event_id"],
+                    "channel_session_ref": binding_ref,
+                    "type": "audio",
+                    "registration_id": registration_id,
+                    "filename": "index-recording.m4a",
+                    "mime_type": "audio/mp4",
+                    "size": len(audio),
+                    "sha256": digest,
+                },
+            )
+            grant_response.raise_for_status()
+            grant = _require_object(grant_response.json(), "artifact grant")
+            registration = _require_object(
+                grant.get("registration"), "artifact registration"
+            )
+            upload_response = await client.post(
+                f"{target.artifact_provider_url}/v1/artifacts",
+                headers={
+                    "Authorization": f"Bearer {target.artifact_provider_token}",
+                    "x-artifact-registration": json.dumps(
+                        registration, ensure_ascii=False, separators=(",", ":")
+                    ),
+                },
+                content=audio,
+            )
+            upload_response.raise_for_status()
+            receipt = _require_object(upload_response.json(), "artifact receipt")
+            artifact = _require_object(receipt.get("artifact"), "artifact reference")
+            if (
+                receipt.get("protocol_version") != "1"
+                or artifact.get("provider_id") != target.artifact_provider_id
+                or artifact.get("registration") != registration
+                or artifact.get("artifact_revision") != digest
+            ):
+                raise ValueError("artifact provider returned an invalid receipt")
+            content = [{"type": "audio", "artifact": artifact}]
+
+        input_response = await client.post(
+            f"{gateway_url}/v1/channel-inputs",
+            headers=headers,
+            json={
+                "protocol_version": "1",
+                "event_id": event["event_id"],
+                "request_id": f"pebble:{event['event_id']}",
+                "channel_session_ref": binding_ref,
+                "reply_binding_ref": target.reply_binding_ref,
+                "presentation_ref": None,
+                "content": content,
+            },
+        )
+        input_response.raise_for_status()
+        result = _require_object(input_response.json(), "Channel acceptance")
+    if result.get("event_id") != event["event_id"] or not isinstance(
+        result.get("turn_id"), str
+    ):
+        raise ValueError("Gateway returned an invalid Channel acceptance")
+    return {**result, "channel_session_ref": binding_ref}
+
+
 def build_target_status_url(target: Target, target_id: str) -> str:
     """Build a safely encoded status URL from target configuration."""
     if not target.status.url_template:
@@ -449,8 +648,26 @@ def build_target_status_url(target: Target, target_id: str) -> str:
     return target.status.url_template.format(id=quote(target_id, safe=""))
 
 
-def build_target_status_request(target: Target, target_id: str) -> TargetStatusRequest:
+def build_target_status_request(
+    target: Target, target_id: str, channel_session_ref: str = ""
+) -> TargetStatusRequest:
     """Describe an outbound target status request without performing I/O."""
+    if target.protocol == "gateway_channel_v1":
+        if not channel_session_ref:
+            raise ValueError("Channel status requires a saved session binding")
+        return TargetStatusRequest(
+            url=f"{target.url.rstrip('/')}/v1/channel-inputs/status",
+            timeout_seconds=target.timeout_seconds,
+            headers=build_target_headers(target),
+            method="POST",
+            json_body={
+                "protocol_version": "1",
+                "event_id": target_id,
+                "channel_session_ref": channel_session_ref,
+                "after_sequence": -1,
+                "after_attempt_id": None,
+            },
+        )
     return TargetStatusRequest(
         url=build_target_status_url(target, target_id),
         timeout_seconds=target.timeout_seconds,
@@ -458,13 +675,17 @@ def build_target_status_request(target: Target, target_id: str) -> TargetStatusR
     )
 
 
-async def _fetch_target_event_status(target: Target, target_id: str) -> dict[str, Any]:
-    request = build_target_status_request(target, target_id)
+async def _fetch_target_event_status(
+    target: Target, target_id: str, channel_session_ref: str = ""
+) -> dict[str, Any]:
+    request = build_target_status_request(target, target_id, channel_session_ref)
     async with httpx.AsyncClient(timeout=request.timeout_seconds) as client:
-        response = await client.get(
-            request.url,
-            headers=request.headers,
-        )
+        if request.method == "POST":
+            response = await client.post(
+                request.url, headers=request.headers, json=request.json_body
+            )
+        else:
+            response = await client.get(request.url, headers=request.headers)
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, dict):
@@ -499,12 +720,21 @@ def find_target_status_lookups(
     lookups = []
     for name, delivery in metadata.get("deliveries", {}).items():
         target = targets_by_name.get(name)
-        if target is None or not target.status.url_template:
+        if target is None or (
+            target.protocol != "gateway_channel_v1" and not target.status.url_template
+        ):
             continue
         target_response = delivery.get("response", {})
         target_id = target_response.get(target.status.id_field)
         if target_id:
-            lookups.append(TargetStatusLookup(name, target, str(target_id)))
+            lookups.append(
+                TargetStatusLookup(
+                    name,
+                    target,
+                    str(target_id),
+                    str(target_response.get("channel_session_ref", "")),
+                )
+            )
     return tuple(lookups)
 
 
@@ -609,7 +839,8 @@ async def health() -> dict[str, Any]:
                 "name": target.name,
                 "url": "<redacted>" if target.is_url_secret else target.url,
                 "body_format": target.request.body_format,
-                "status_tracking": bool(target.status.url_template),
+                "status_tracking": target.protocol == "gateway_channel_v1"
+                or bool(target.status.url_template),
             }
             for target in settings.targets
         ],
@@ -639,9 +870,14 @@ async def event_status(
     target_events: dict[str, Any] = {}
     for lookup in find_target_status_lookups(settings.targets, metadata):
         try:
-            target_events[lookup.name] = await _fetch_target_event_status(
-                lookup.target, lookup.target_id
-            )
+            if lookup.channel_session_ref:
+                target_events[lookup.name] = await _fetch_target_event_status(
+                    lookup.target, lookup.target_id, lookup.channel_session_ref
+                )
+            else:
+                target_events[lookup.name] = await _fetch_target_event_status(
+                    lookup.target, lookup.target_id
+                )
         except Exception as exc:
             target_events[lookup.name] = {"error": str(exc)}
     if target_events:
